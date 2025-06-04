@@ -1,0 +1,302 @@
+<?php
+set_time_limit(900);
+ini_set('memory_limit', '-1');
+
+$scanExt = ['php','pht','phtml','php3','php4','php5','php7','php8','phar','suspected'];
+
+$dangerTokens = [
+    'base64_decode','urldecode','implode','strtr','substr','str_replace','substr_replace',
+    'preg_replace','eval','basename','phpinfo','mysqli_query','fopen','file_put_contents',
+    'file_get_contents','move_uploaded_file','$_files','__file__','curl_init','ini_set','set_time_limit'
+];
+
+function scanDirectory(string $dir, array &$results = []): void {
+    if (!is_dir($dir) || !is_readable($dir)) return;
+
+    $entries = scandir($dir);
+    foreach ($entries as $entry) {
+        if ($entry === '.' || $entry === '..') continue;
+        $path = $dir . DIRECTORY_SEPARATOR . $entry;
+        if (is_dir($path)) {
+            scanDirectory($path, $results);
+        } elseif (is_file($path) && is_readable($path)) {
+            $results[] = $path;
+        }
+    }
+}
+
+function filterByExtension(array $files, array $exts): array {
+    return array_filter($files, fn($file) => in_array(strtolower(pathinfo($file, PATHINFO_EXTENSION)), $exts));
+}
+
+function getTokensFromFile(string $file): array {
+    $content = @file_get_contents($file);
+    if ($content === false) return [];
+
+    // Normalize PHP tags (optional)
+    $content = preg_replace('/<\?([^p=\w])/m', '<?php ', $content);
+
+    $tokens = token_get_all($content);
+    $words = [];
+
+    foreach ($tokens as $token) {
+        if (is_array($token)) {
+            $word = strtolower(trim($token[1]));
+            if ($word !== '') $words[] = $word;
+        }
+    }
+
+    return array_unique($words);
+}
+
+function intersectTokens(array $needles, array $haystack): array {
+    return array_values(array_intersect($needles, $haystack));
+}
+
+function relativePath(string $base, string $path): string {
+    // Simple relative path converter to show shorter path in output
+    if (str_starts_with($path, $base)) {
+        return substr($path, strlen($base) + 1);
+    }
+    return $path;
+}
+
+$baseDir = $_POST['dir'] ?? getcwd();
+$baseDir = rtrim(realpath($baseDir), DIRECTORY_SEPARATOR);
+
+?>
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>xxxTYPOxxx Edition</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Ubuntu+Mono&display=swap');
+
+  body {
+    margin: 0; padding: 0;
+    font-family: 'Ubuntu Mono', monospace;
+    background: rgb(12,12,22);
+    color: rgb(230,230,230);
+    min-height: 100vh;
+    display: flex; flex-direction: column; align-items: center;
+    padding: 1rem 0 4rem 0;
+  }
+  header {
+    font-size: 2.6rem;
+    font-weight: 900;
+    color: rgb(255,40,80);
+    text-shadow: 0 0 10px rgb(255,40,80);
+    margin-bottom: 0.8rem;
+  }
+  form {
+    width: 90%;
+    max-width: 920px;
+    display: flex;
+    gap: 1rem;
+    margin-bottom: 1.5rem;
+  }
+  input[type=text] {
+    flex-grow: 1;
+    padding: 14px 18px;
+    font-size: 1.15rem;
+    background: rgb(20,20,38);
+    border: 3px solid rgb(255,40,80);
+    border-radius: 10px;
+    color: rgb(230,230,230);
+    transition: border-color 0.3s ease;
+  }
+  input[type=text]:focus {
+    outline: none;
+    border-color: rgb(255,100,120);
+    box-shadow: 0 0 12px rgb(255,100,120);
+  }
+  input[type=submit] {
+    background: rgb(255,40,80);
+    border: none;
+    color: white;
+    font-weight: 700;
+    font-size: 1.15rem;
+    padding: 14px 30px;
+    border-radius: 10px;
+    cursor: pointer;
+    user-select: none;
+    transition: background-color 0.3s ease;
+  }
+  input[type=submit]:hover {
+    background: rgb(255,70,110);
+  }
+  table {
+    border-collapse: collapse;
+    width: 90%;
+    max-width: 920px;
+    margin-top: 0.5rem;
+    color: rgb(230,230,230);
+    box-shadow:
+      0 0 10px rgb(255,40,80,0.2),
+      0 0 30px rgb(255,40,80,0.15);
+    border-radius: 12px;
+    overflow: hidden;
+  }
+  thead {
+    background: rgb(255,40,80);
+    color: white;
+    font-weight: 900;
+    font-size: 1.1rem;
+  }
+  th, td {
+    padding: 12px 15px;
+    word-break: break-word;
+  }
+  tbody tr:nth-child(even) {
+    background: rgb(30,30,55);
+  }
+  tbody tr:nth-child(odd) {
+    background: rgb(25,25,45);
+  }
+  td.file-path {
+    color: rgb(255, 100, 120);
+    font-weight: 600;
+  }
+  td.tokens {
+    color: rgb(120, 220, 255);
+    font-weight: 600;
+    font-size: 0.95rem;
+  }
+  button.copy-btn {
+    margin-top: 18px;
+    background: rgb(20, 20, 38);
+    border: 2px solid rgb(255,40,80);
+    color: rgb(255,40,80);
+    font-weight: 700;
+    padding: 12px 24px;
+    border-radius: 10px;
+    cursor: pointer;
+    transition: background-color 0.3s ease, color 0.3s ease;
+    user-select: none;
+  }
+  button.copy-btn:hover {
+    background: rgb(255,40,80);
+    color: white;
+    box-shadow: 0 0 15px rgb(255,40,80);
+  }
+  p.no-result {
+    font-style: italic;
+    color: rgb(180, 180, 180);
+    margin-top: 20px;
+    font-size: 1.1rem;
+  }
+  @media (max-width: 640px) {
+    input[type=text], input[type=submit], button.copy-btn {
+      font-size: 1rem;
+      padding: 10px 14px;
+    }
+    th, td {
+      padding: 8px 10px;
+      font-size: 0.9rem;
+    }
+  }
+</style>
+</head>
+<body>
+
+<header>xxxTYPOxxx</header>
+
+<form method="post" autocomplete="off">
+  <input
+    type="text"
+    name="dir"
+    placeholder="Masukkan direktori untuk scan..."
+    value="<?= htmlspecialchars($_POST['dir'] ?? $baseDir) ?>"
+    required
+  />
+  <input type="submit" value="SCAN" />
+</form>
+
+<?php if ($_SERVER['REQUEST_METHOD'] === 'POST'): ?>
+
+  <?php if (!is_dir($baseDir) || !is_readable($baseDir)): ?>
+    <p class="no-result">Direktori tidak ditemukan atau tidak dapat diakses.</p>
+  <?php else: ?>
+    <?php
+      $allFiles = [];
+      scanDirectory($baseDir, $allFiles);
+      $filteredFiles = filterByExtension($allFiles, $scanExt);
+
+      $foundFiles = [];
+      foreach ($filteredFiles as $file) {
+          $tokens = getTokensFromFile($file);
+          $intersect = intersectTokens($dangerTokens, $tokens);
+          if (count($intersect) > 0) {
+              $foundFiles[] = [
+                'path' => $file,
+                'tokens' => $intersect
+              ];
+          }
+      }
+    ?>
+
+    <?php if (count($foundFiles) === 0): ?>
+      <p class="no-result">Tidak ditemukan file dengan token berbahaya di direktori ini.</p>
+    <?php else: ?>
+      <table aria-label="Hasil scan file berbahaya">
+        <thead>
+          <tr>
+            <th>File Path</th>
+            <th>Fungsi / Token Terdeteksi</th>
+          </tr>
+        </thead>
+        <tbody>
+          <?php foreach ($foundFiles as $item): ?>
+            <tr>
+              <td class="file-path"><?= htmlspecialchars(relativePath($baseDir, $item['path'])) ?></td>
+              <td class="tokens"><?= htmlspecialchars(implode(', ', $item['tokens'])) ?></td>
+            </tr>
+          <?php endforeach; ?>
+        </tbody>
+      </table>
+
+      <button class="copy-btn" onclick="copyTableToClipboard()">Copy Semua Hasil</button>
+    <?php endif; ?>
+  <?php endif; ?>
+
+<?php endif; ?>
+
+<script>
+function copyTableToClipboard() {
+  const table = document.querySelector('table');
+  if (!table) {
+    alert('Tidak ada hasil yang dapat disalin.');
+    return;
+  }
+  let range, selection;
+
+  if (window.getSelection && document.createRange) {
+    selection = window.getSelection();
+    selection.removeAllRanges();
+
+    range = document.createRange();
+    range.selectNodeContents(table);
+    selection.addRange(range);
+
+    try {
+      const successful = document.execCommand('copy');
+      if (successful) {
+        alert('Hasil berhasil disalin ke clipboard!');
+      } else {
+        alert('Gagal menyalin otomatis, silakan salin manual.');
+      }
+    } catch (err) {
+      alert('Browser tidak mendukung fungsi copy otomatis.');
+    }
+    selection.removeAllRanges();
+  } else {
+    alert('Browser Anda tidak mendukung fitur copy otomatis.');
+  }
+}
+</script>
+
+</body>
+</html>
