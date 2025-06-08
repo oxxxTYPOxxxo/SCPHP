@@ -1,8 +1,8 @@
 <?php
 
 $GLOBALS['xxxTYPOxxx'] = array(
-    'username' => '3KGBaoBao',
-    'password' => 'd8ae95d68a715111d69902895cd874de',
+    'username' => 'xxxTYPOxxx',
+    'password' => '904ea459a92cea72f4eaae845e05a5d1',
     'safe_mode' => '1',
     'login_page' => '403',
     'show_icons' => '1',
